@@ -1,4 +1,4 @@
-const APP_VERSION = '1.0.6';
+const APP_VERSION = '1.0.7';
 const CACHE_NAME = `ruler-${APP_VERSION}`;
 
 const PRECACHE_URLS = [
