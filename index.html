@@ -232,18 +232,20 @@
     <script type="module">
         import * as THREE from './vendor/three.module.js';
         import { APP_VERSION } from './version.js';
+        import { hitTestDetectedPlanes, filterPlaneHitResults } from './vendor/plane-hit-test.js';
 
         document.getElementById('app-version').textContent = `v${APP_VERSION}`;
 
         const UNITS = ['m', 'cm', 'in', 'ft'];
         const UNIT_STORAGE_KEY = 'ruler-unit';
         const INFO_POINT1 = 'Point at a surface and tap to place point 1.';
-        const SCAN_HINT = 'Slowly move phone side to side to scan the area first.';
-        const SURFACE_HINT = 'Point at a textured surface (floor, table, rug) and tap.';
+        const SCAN_HINT = 'Move phone slowly in a arc — ARCore maps walls and floor. Watch the surface count rise.';
+        const SURFACE_HINT = 'Keep scanning — point at a wall, floor, or table with texture.';
         const ROTATE_HINT = 'Point 1 locked. Move phone to the other end, then tap point 2.';
         const DONE_HINT = 'Tap again to measure something else.';
         const SURFACE_HINT_DELAY_MS = 1000;
         const READY_HINT = 'Green ring visible — tap to place a point.';
+        const SCANNING_HINT = (count) => `${count} surface${count === 1 ? '' : 's'} mapped — keep scanning…`;
 
         const upVector = new THREE.Vector3(0, 1, 0);
         const tempDirection = new THREE.Vector3();
@@ -257,6 +259,9 @@
 
         let hitTestSource = null;
         let hitTestSourceRequested = false;
+        let planeDetectionEnabled = false;
+        let detectedPlaneCount = 0;
+        let lastPlaneHitResult = null;
         let arSessionActive = false;
         let reticleLastVisibleAt = 0;
         let lastSelectAt = 0;
@@ -389,7 +394,7 @@
 
         const sessionInit = {
             requiredFeatures: ['hit-test'],
-            optionalFeatures: ['dom-overlay', 'anchors'],
+            optionalFeatures: ['dom-overlay', 'anchors', 'plane-detection'],
             domOverlay: { root: arUi },
         };
 
@@ -415,7 +420,9 @@
             renderer.xr.setReferenceSpaceType('local');
             await renderer.xr.setSession(session);
 
+            planeDetectionEnabled = session.enabledFeatures.includes('plane-detection');
             resetHitTestSources();
+            setupHitTestSource(session);
             arSessionActive = true;
             scanHintShown = false;
             measurementComplete = false;
@@ -442,6 +449,9 @@
             xrSession = null;
             arSessionActive = false;
             resetHitTestSources();
+            planeDetectionEnabled = false;
+            detectedPlaneCount = 0;
+            lastPlaneHitResult = null;
             reticle.visible = false;
             point1Indicator.classList.remove('visible');
 
@@ -499,16 +509,27 @@
 
             const frame = event.frame;
             const referenceSpace = renderer.xr.getReferenceSpace();
-            if (frame && hitTestSource && typeof frame.createAnchor === 'function') {
-                const results = frame.getHitTestResults(hitTestSource);
-                if (results.length > 0) {
-                    const pose = results[0].getPose(referenceSpace);
-                    if (pose) {
-                        frame.createAnchor(pose.transform, referenceSpace).then((anchor) => {
-                            point.anchor = anchor;
-                        }).catch((error) => {
-                            console.warn('Anchor unavailable', error);
-                        });
+            if (frame && typeof frame.createAnchor === 'function') {
+                if (lastPlaneHitResult) {
+                    frame.createAnchor(
+                        new XRRigidTransform(lastPlaneHitResult.point_on_plane),
+                        lastPlaneHitResult.plane.planeSpace
+                    ).then((anchor) => {
+                        point.anchor = anchor;
+                    }).catch((error) => {
+                        console.warn('Plane anchor unavailable', error);
+                    });
+                } else if (hitTestSource) {
+                    const results = frame.getHitTestResults(hitTestSource);
+                    if (results.length > 0) {
+                        const pose = results[0].getPose(referenceSpace);
+                        if (pose) {
+                            frame.createAnchor(pose.transform, referenceSpace).then((anchor) => {
+                                point.anchor = anchor;
+                            }).catch((error) => {
+                                console.warn('Anchor unavailable', error);
+                            });
+                        }
                     }
                 }
             }
@@ -721,10 +742,19 @@
 
             if (reticle.visible) {
                 reticleLastVisibleAt = performance.now();
-                if (placedPoints.length === 0
-                    && (info.textContent === SURFACE_HINT || info.textContent === SCAN_HINT)) {
-                    info.textContent = READY_HINT;
+                if (placedPoints.length === 0 && info.textContent !== READY_HINT) {
+                    const scanning = info.textContent.includes('mapped');
+                    if (info.textContent === SURFACE_HINT
+                        || info.textContent === SCAN_HINT
+                        || scanning) {
+                        info.textContent = READY_HINT;
+                    }
                 }
+                return;
+            }
+
+            if (planeDetectionEnabled && detectedPlaneCount > 0 && placedPoints.length === 0) {
+                info.textContent = SCANNING_HINT(detectedPlaneCount);
                 return;
             }
 
@@ -743,23 +773,60 @@
             renderer.setAnimationLoop(render);
         }
 
+        function updateReticle(frame, referenceSpace) {
+            reticle.visible = false;
+            lastPlaneHitResult = null;
+
+            if (hitTestSource) {
+                const nativeHits = frame.getHitTestResults(hitTestSource);
+                if (nativeHits.length > 0) {
+                    const pose = nativeHits[0].getPose(referenceSpace);
+                    if (pose) {
+                        reticle.visible = true;
+                        reticle.matrix.fromArray(pose.transform.matrix);
+                        reticleLastVisibleAt = performance.now();
+                        return;
+                    }
+                }
+            }
+
+            if (!planeDetectionEnabled || !frame.detectedPlanes) {
+                return;
+            }
+
+            detectedPlaneCount = frame.detectedPlanes.size;
+            if (detectedPlaneCount === 0) {
+                return;
+            }
+
+            const viewerPose = frame.getViewerPose(referenceSpace);
+            if (!viewerPose) {
+                return;
+            }
+
+            const ray = new XRRay(viewerPose.transform);
+            const planeHits = filterPlaneHitResults(
+                hitTestDetectedPlanes(frame, ray, referenceSpace),
+                true
+            );
+
+            if (planeHits.length === 0) {
+                return;
+            }
+
+            lastPlaneHitResult = planeHits[0];
+            reticle.visible = true;
+            reticle.matrix.fromArray(lastPlaneHitResult.hitMatrix);
+            reticleLastVisibleAt = performance.now();
+        }
+
         function render(timestamp, frame) {
             if (frame) {
                 const referenceSpace = renderer.xr.getReferenceSpace();
                 const session = renderer.xr.getSession();
 
                 setupHitTestSource(session);
-
-                if (hitTestSource) {
-                    const hitTestResults = frame.getHitTestResults(hitTestSource);
-                    if (hitTestResults.length > 0) {
-                        const hit = hitTestResults[0];
-                        reticle.visible = true;
-                        reticle.matrix.fromArray(hit.getPose(referenceSpace).transform.matrix);
-                    } else {
-                        reticle.visible = false;
-                    }
-                }
+                updateReticle(frame, referenceSpace);
 
                 updateAnchoredPoints();
 

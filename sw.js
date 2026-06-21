@@ -1,4 +1,4 @@
-const APP_VERSION = '1.2.0';
+const APP_VERSION = '1.3.0';
 const CACHE_NAME = `ruler-${APP_VERSION}`;
 
 const PRECACHE_URLS = [
@@ -9,6 +9,7 @@ const PRECACHE_URLS = [
   './icons/icon-512.png',
   './vendor/three.module.js',
   './vendor/ARButton.js',
+  './vendor/plane-hit-test.js',
 ];
 
 self.addEventListener('install', (event) => {
