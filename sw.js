@@ -1,7 +1,9 @@
-const CACHE_NAME = 'ruler-v2';
+const APP_VERSION = '1.0.3';
+const CACHE_NAME = `ruler-${APP_VERSION}`;
 
 const PRECACHE_URLS = [
   './index.html',
+  './version.js',
   './manifest.webmanifest',
   './icons/icon-192.png',
   './icons/icon-512.png',

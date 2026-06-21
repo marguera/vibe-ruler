@@ -168,6 +168,16 @@
             color: #00ff88;
             margin-top: 24px;
         }
+        #app-version {
+            position: fixed;
+            bottom: 8px;
+            left: 12px;
+            z-index: 150;
+            font-size: 0.7rem;
+            opacity: 0.45;
+            pointer-events: none;
+            text-shadow: 1px 1px 2px black;
+        }
     </style>
 </head>
 <body>
@@ -176,6 +186,8 @@
         <p>This app needs Android Chrome and ARCore support. Your device or browser cannot run AR measurements.</p>
         <a href="https://developers.google.com/ar/devices" target="_blank" rel="noopener">Check ARCore supported devices</a>
     </div>
+
+    <div id="app-version"></div>
 
     <div id="launch-screen">
         <div class="logo"></div>
@@ -196,6 +208,9 @@
 
     <script type="module">
         import * as THREE from './vendor/three.module.js';
+        import { APP_VERSION } from './version.js';
+
+        document.getElementById('app-version').textContent = `v${APP_VERSION}`;
 
         const UNITS = ['m', 'cm', 'in', 'ft'];
         const UNIT_STORAGE_KEY = 'ruler-unit';
