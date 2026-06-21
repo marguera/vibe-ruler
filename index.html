@@ -18,13 +18,69 @@
             background-color: #111;
             color: white;
         }
+        #canvas-container {
+            position: fixed;
+            inset: 0;
+        }
+        #canvas-container canvas {
+            display: block;
+        }
+        #launch-screen {
+            position: fixed;
+            inset: 0;
+            z-index: 50;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            padding: 32px;
+            box-sizing: border-box;
+            background: radial-gradient(circle at center, #1a1a1a 0%, #111 70%);
+            cursor: pointer;
+        }
+        #launch-screen.hidden {
+            display: none;
+        }
+        #launch-screen .logo {
+            width: 72px;
+            height: 72px;
+            border: 3px solid #00ff88;
+            border-radius: 50%;
+            margin-bottom: 24px;
+            box-shadow: 0 0 24px rgba(0, 255, 136, 0.25);
+        }
+        #launch-screen h1 {
+            margin: 0 0 12px;
+            font-size: 1.75rem;
+        }
+        #launch-screen p {
+            margin: 0 0 28px;
+            opacity: 0.75;
+            line-height: 1.5;
+            max-width: 320px;
+        }
+        #start-btn {
+            padding: 14px 32px;
+            font-size: 1.1rem;
+            font-weight: 600;
+            background: #00ff88;
+            color: #111;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+        }
+        #ar-ui {
+            position: fixed;
+            inset: 0;
+            z-index: 100;
+            pointer-events: none;
+        }
         #info {
             position: absolute;
             top: 10px;
             width: 100%;
             text-align: center;
-            z-index: 100;
-            pointer-events: none;
             text-shadow: 1px 1px 2px black;
             padding: 0 16px;
             box-sizing: border-box;
@@ -36,12 +92,12 @@
             text-align: center;
             font-size: 2rem;
             font-weight: bold;
-            z-index: 100;
             cursor: pointer;
-            text-shadow: 2px 2px 4px rgba(0,0,0,0.8);
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.8);
             color: #00ff88;
             user-select: none;
             -webkit-tap-highlight-color: transparent;
+            pointer-events: auto;
         }
         #measurement-label.pulse {
             animation: pulse 0.6s ease-out;
@@ -58,24 +114,30 @@
             text-align: center;
             font-size: 0.75rem;
             opacity: 0.6;
-            z-index: 100;
-            pointer-events: none;
         }
-        #clear-btn {
+        #clear-btn,
+        #stop-ar-btn {
             position: absolute;
             bottom: 20px;
-            left: 50%;
-            transform: translateX(-50%);
             padding: 12px 24px;
             font-size: 1rem;
             background: rgba(255, 255, 255, 0.2);
             color: white;
             border: 1px solid white;
             border-radius: 8px;
-            z-index: 100;
             cursor: pointer;
             backdrop-filter: blur(4px);
+            pointer-events: auto;
             display: none;
+        }
+        #clear-btn {
+            left: 50%;
+            transform: translateX(-50%);
+        }
+        #stop-ar-btn {
+            right: 16px;
+            padding: 10px 16px;
+            font-size: 0.9rem;
         }
         #unsupported {
             display: none;
@@ -115,23 +177,35 @@
         <a href="https://developers.google.com/ar/devices" target="_blank" rel="noopener">Check ARCore supported devices</a>
     </div>
 
-    <div id="info">Ruler<br/>Point phone at floor/surface and tap to place points.</div>
-    <div id="measurement-label">0.00 m</div>
-    <div id="unit-hint">Tap measurement to change units</div>
-    <button id="clear-btn">Clear Points</button>
+    <div id="launch-screen">
+        <div class="logo"></div>
+        <h1>Ruler</h1>
+        <p>Measure real-world distances in AR. Point at a floor or table, then tap to place two points.</p>
+        <button id="start-btn" type="button">Start measuring</button>
+    </div>
+
+    <div id="canvas-container"></div>
+
+    <div id="ar-ui">
+        <div id="info">Point at a surface and tap to place points.</div>
+        <div id="measurement-label">0.00 m</div>
+        <div id="unit-hint">Tap measurement to change units</div>
+        <button id="clear-btn" type="button">Clear points</button>
+        <button id="stop-ar-btn" type="button">Exit AR</button>
+    </div>
 
     <script type="module">
         import * as THREE from './vendor/three.module.js';
-        import { ARButton } from './vendor/ARButton.js';
 
         const UNITS = ['m', 'cm', 'in', 'ft'];
         const UNIT_STORAGE_KEY = 'ruler-unit';
-        const DEFAULT_INFO = 'Ruler<br/>Point phone at floor/surface and tap to place points.';
+        const DEFAULT_INFO = 'Point at a surface and tap to place points.';
         const SURFACE_HINT = 'Move phone slowly and point at a textured surface (floor, table, rug).';
         const SURFACE_HINT_DELAY_MS = 1000;
 
         let camera, scene, renderer;
         let controller, reticle;
+        let xrSession = null;
 
         let hitTestSource = null;
         let hitTestSourceRequested = false;
@@ -144,13 +218,32 @@
         let lastDistanceM = 0;
         let currentUnit = loadUnit();
 
+        const launchScreen = document.getElementById('launch-screen');
+        const canvasContainer = document.getElementById('canvas-container');
+        const arUi = document.getElementById('ar-ui');
         const info = document.getElementById('info');
         const label = document.getElementById('measurement-label');
         const clearBtn = document.getElementById('clear-btn');
+        const stopArBtn = document.getElementById('stop-ar-btn');
+        const startBtn = document.getElementById('start-btn');
         const unsupported = document.getElementById('unsupported');
 
-        label.addEventListener('click', cycleUnit);
-        clearBtn.addEventListener('click', () => clearMeasurements());
+        label.addEventListener('click', (event) => {
+            event.stopPropagation();
+            cycleUnit();
+        });
+        clearBtn.addEventListener('click', (event) => {
+            event.stopPropagation();
+            clearMeasurements();
+        });
+        stopArBtn.addEventListener('click', (event) => {
+            event.stopPropagation();
+            endARSession();
+        });
+        startBtn.addEventListener('click', (event) => {
+            event.stopPropagation();
+            startARSession();
+        });
 
         start();
 
@@ -204,6 +297,7 @@
             const xr = navigator.xr;
             if (!xr || !(await xr.isSessionSupported('immersive-ar'))) {
                 unsupported.classList.add('visible');
+                launchScreen.classList.add('hidden');
                 return;
             }
 
@@ -212,9 +306,6 @@
         }
 
         function init() {
-            const container = document.createElement('div');
-            document.body.appendChild(container);
-
             scene = new THREE.Scene();
             camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
 
@@ -226,9 +317,7 @@
             renderer.setPixelRatio(window.devicePixelRatio);
             renderer.setSize(window.innerWidth, window.innerHeight);
             renderer.xr.enabled = true;
-            container.appendChild(renderer.domElement);
-
-            document.body.appendChild(ARButton.createButton(renderer, { requiredFeatures: ['hit-test'] }));
+            canvasContainer.appendChild(renderer.domElement);
 
             controller = renderer.xr.getController(0);
             controller.addEventListener('select', onSelect);
@@ -243,25 +332,66 @@
             scene.add(reticle);
 
             window.addEventListener('resize', onWindowResize);
+            label.textContent = formatZero();
+        }
 
-            renderer.xr.addEventListener('sessionstart', () => {
+        const sessionInit = {
+            requiredFeatures: ['hit-test'],
+            optionalFeatures: ['dom-overlay'],
+            domOverlay: { root: arUi },
+        };
+
+        async function startARSession() {
+            if (xrSession) {
+                return;
+            }
+
+            try {
+                const session = await navigator.xr.requestSession('immersive-ar', sessionInit);
+                xrSession = session;
+
+                session.addEventListener('end', onARSessionEnded);
+
+                renderer.xr.setReferenceSpaceType('local');
+                await renderer.xr.setSession(session);
+
+                hitTestSourceRequested = false;
+                hitTestSource = null;
                 arSessionActive = true;
                 reticleLastVisibleAt = performance.now();
+
+                launchScreen.classList.add('hidden');
                 clearBtn.style.display = 'block';
-                info.innerHTML = DEFAULT_INFO;
-            });
+                stopArBtn.style.display = 'block';
+                info.textContent = DEFAULT_INFO;
+            } catch (error) {
+                console.error('Failed to start AR session', error);
+                info.textContent = 'Could not start AR. Check camera permission and try again.';
+            }
+        }
 
-            renderer.xr.addEventListener('sessionend', () => {
-                arSessionActive = false;
-                clearBtn.style.display = 'none';
-                info.innerHTML = DEFAULT_INFO;
-            });
+        function endARSession() {
+            if (xrSession) {
+                xrSession.end();
+            }
+        }
 
-            label.textContent = formatZero();
+        function onARSessionEnded() {
+            xrSession = null;
+            arSessionActive = false;
+            hitTestSourceRequested = false;
+            hitTestSource = null;
+            reticle.visible = false;
+
+            launchScreen.classList.remove('hidden');
+            clearBtn.style.display = 'none';
+            stopArBtn.style.display = 'none';
+            info.textContent = DEFAULT_INFO;
         }
 
         function onSelect() {
             if (!reticle.visible) {
+                info.textContent = SURFACE_HINT;
                 return;
             }
 
@@ -282,6 +412,8 @@
             if (measurements.length === 2) {
                 drawLine();
                 calculateDistance();
+            } else {
+                info.textContent = 'Tap a second point to measure.';
             }
         }
 
@@ -295,6 +427,7 @@
         function calculateDistance() {
             lastDistanceM = measurements[0].distanceTo(measurements[1]);
             updateMeasurementLabel(lastDistanceM, true);
+            info.textContent = 'Tap again to measure something else.';
         }
 
         function updateMeasurementLabel(meters, pulse) {
@@ -316,6 +449,7 @@
             }
             lastDistanceM = 0;
             label.textContent = formatZero();
+            info.textContent = DEFAULT_INFO;
         }
 
         function onWindowResize() {
@@ -331,14 +465,14 @@
 
             if (reticle.visible) {
                 reticleLastVisibleAt = performance.now();
-                if (info.innerHTML === SURFACE_HINT) {
-                    info.innerHTML = DEFAULT_INFO;
+                if (info.textContent === SURFACE_HINT) {
+                    info.textContent = DEFAULT_INFO;
                 }
                 return;
             }
 
             if (performance.now() - reticleLastVisibleAt >= SURFACE_HINT_DELAY_MS) {
-                info.innerHTML = SURFACE_HINT;
+                info.textContent = SURFACE_HINT;
             }
         }
 
@@ -356,10 +490,6 @@
                         session.requestHitTestSource({ space: viewerSpace }).then((source) => {
                             hitTestSource = source;
                         });
-                    });
-                    session.addEventListener('end', () => {
-                        hitTestSourceRequested = false;
-                        hitTestSource = null;
                     });
                     hitTestSourceRequested = true;
                 }
