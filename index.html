@@ -242,8 +242,8 @@
         const SURFACE_HINT = 'Point at a textured surface (floor, table, rug) and tap.';
         const ROTATE_HINT = 'Point 1 locked. Move phone to the other end, then tap point 2.';
         const DONE_HINT = 'Tap again to measure something else.';
-        const ANCHOR_FAIL_HINT = 'Could not lock point to surface. Scan more, then retry.';
         const SURFACE_HINT_DELAY_MS = 1000;
+        const READY_HINT = 'Green ring visible — tap to place a point.';
 
         const upVector = new THREE.Vector3(0, 1, 0);
         const tempDirection = new THREE.Vector3();
@@ -254,11 +254,8 @@
         let camera, scene, renderer;
         let reticle;
         let xrSession = null;
-        let localReferenceSpace = null;
-        let currentFrame = null;
 
         let hitTestSource = null;
-        let transientHitTestSource = null;
         let hitTestSourceRequested = false;
         let arSessionActive = false;
         let reticleLastVisibleAt = 0;
@@ -376,9 +373,10 @@
 
             const controller = renderer.xr.getController(0);
             controller.addEventListener('select', onSelect);
+            scene.add(controller);
 
             reticle = new THREE.Mesh(
-                new THREE.RingGeometry(0.06, 0.08, 32).rotateX(-Math.PI / 2),
+                new THREE.RingGeometry(0.15, 0.2, 32).rotateX(-Math.PI / 2),
                 new THREE.MeshBasicMaterial({ color: 0x00ff88 })
             );
             reticle.matrixAutoUpdate = false;
@@ -413,11 +411,9 @@
             xrSession = session;
 
             session.addEventListener('end', onARSessionEnded);
-            session.addEventListener('select', onSelect);
 
             renderer.xr.setReferenceSpaceType('local');
             await renderer.xr.setSession(session);
-            localReferenceSpace = renderer.xr.getReferenceSpace();
 
             resetHitTestSources();
             arSessionActive = true;
@@ -434,7 +430,6 @@
         function resetHitTestSources() {
             hitTestSourceRequested = false;
             hitTestSource = null;
-            transientHitTestSource = null;
         }
 
         function endARSession() {
@@ -446,8 +441,6 @@
         function onARSessionEnded() {
             xrSession = null;
             arSessionActive = false;
-            localReferenceSpace = null;
-            currentFrame = null;
             resetHitTestSources();
             reticle.visible = false;
             point1Indicator.classList.remove('visible');
@@ -459,7 +452,7 @@
             info.textContent = INFO_POINT1;
         }
 
-        function setupHitTestSources(session) {
+        function setupHitTestSource(session) {
             if (hitTestSourceRequested) {
                 return;
             }
@@ -468,59 +461,26 @@
                 session.requestHitTestSource({ space: viewerSpace }).then((source) => {
                     hitTestSource = source;
                 });
-                session.requestHitTestSourceForTransientInput('generic-touchscreen').then((source) => {
-                    transientHitTestSource = source;
-                }).catch(() => {
-                    // Transient input unavailable on this device
-                });
+            });
+
+            session.addEventListener('end', () => {
+                hitTestSourceRequested = false;
+                hitTestSource = null;
             });
 
             hitTestSourceRequested = true;
         }
 
-        function getHitPose(frame) {
-            if (!localReferenceSpace) {
-                return null;
-            }
-
-            if (transientHitTestSource) {
-                const transientResults = frame.getHitTestResultsForTransientInput(transientHitTestSource);
-                if (transientResults.length > 0) {
-                    const pose = transientResults[0].getPose(localReferenceSpace);
-                    if (pose) {
-                        return pose;
-                    }
-                }
-            }
-
-            if (hitTestSource) {
-                const hitResults = frame.getHitTestResults(hitTestSource);
-                if (hitResults.length > 0) {
-                    const pose = hitResults[0].getPose(localReferenceSpace);
-                    if (pose) {
-                        return pose;
-                    }
-                }
-            }
-
-            return null;
-        }
-
-        async function onSelect(event) {
+        // Same flow as three.js webxr_ar_hittest + Google Hello WebXR:
+        // tap only when reticle.visible; copy reticle pose into scene geometry.
+        function onSelect(event) {
             const now = performance.now();
             if (now - lastSelectAt < 250) {
                 return;
             }
-
-            const frame = event.frame ?? currentFrame;
-            if (!frame || !arSessionActive || !localReferenceSpace) {
-                return;
-            }
-
             lastSelectAt = now;
 
-            const pose = getHitPose(frame);
-            if (!pose) {
+            if (!reticle.visible) {
                 info.textContent = SURFACE_HINT;
                 return;
             }
@@ -529,27 +489,29 @@
                 clearMeasurements();
             }
 
-            if (typeof frame.createAnchor !== 'function') {
-                info.textContent = 'Anchors not supported. Update Chrome or try another device.';
-                return;
-            }
-
-            let anchor;
-            try {
-                anchor = await frame.createAnchor(pose.transform, localReferenceSpace);
-            } catch (error) {
-                console.error('createAnchor failed', error);
-                info.textContent = ANCHOR_FAIL_HINT;
-                return;
-            }
-
             const marker = createPointMarker();
-            marker.matrix.fromArray(pose.transform.matrix);
+            reticle.matrix.decompose(marker.position, marker.quaternion, marker.scale);
             scene.add(marker);
 
-            placedPoints.push({ marker, anchor });
+            const point = { marker, anchor: null };
+            placedPoints.push(point);
             measurementComplete = false;
-            scene.updateMatrixWorld(true);
+
+            const frame = event.frame;
+            const referenceSpace = renderer.xr.getReferenceSpace();
+            if (frame && hitTestSource && typeof frame.createAnchor === 'function') {
+                const results = frame.getHitTestResults(hitTestSource);
+                if (results.length > 0) {
+                    const pose = results[0].getPose(referenceSpace);
+                    if (pose) {
+                        frame.createAnchor(pose.transform, referenceSpace).then((anchor) => {
+                            point.anchor = anchor;
+                        }).catch((error) => {
+                            console.warn('Anchor unavailable', error);
+                        });
+                    }
+                }
+            }
 
             if (placedPoints.length === 2) {
                 drawLine();
@@ -564,21 +526,20 @@
 
         function createPointMarker() {
             const group = new THREE.Group();
-            group.matrixAutoUpdate = false;
 
             const markerMaterial = new THREE.MeshBasicMaterial({ color: 0xff6600 });
 
-            const sphere = new THREE.Mesh(new THREE.SphereGeometry(0.012, 16, 16), markerMaterial);
+            const sphere = new THREE.Mesh(new THREE.SphereGeometry(0.03, 16, 16), markerMaterial);
 
             const pole = new THREE.Mesh(
-                new THREE.CylinderGeometry(0.003, 0.003, 0.04, 8),
+                new THREE.CylinderGeometry(0.008, 0.008, 0.1, 8),
                 markerMaterial
             );
-            pole.position.y = 0.02;
+            pole.position.y = 0.05;
 
             const ring = new THREE.Mesh(
-                new THREE.RingGeometry(0.018, 0.024, 32).rotateX(-Math.PI / 2),
-                new THREE.MeshBasicMaterial({ color: 0x00ff88, side: THREE.DoubleSide })
+                new THREE.RingGeometry(0.04, 0.055, 32).rotateX(-Math.PI / 2),
+                new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide })
             );
 
             group.add(sphere);
@@ -588,20 +549,31 @@
         }
 
         function getMarkerPosition(marker, target) {
-            marker.updateMatrixWorld(true);
-            return target.setFromMatrixPosition(marker.matrixWorld);
+            return target.copy(marker.position);
         }
 
         function updateAnchoredPoints() {
-            if (!localReferenceSpace) {
+            const referenceSpace = renderer.xr.getReferenceSpace();
+            if (!referenceSpace) {
                 return;
             }
 
             for (const point of placedPoints) {
-                const anchorPose = point.anchor.anchorSpace.getPose(localReferenceSpace);
-                if (anchorPose) {
-                    point.marker.matrix.fromArray(anchorPose.transform.matrix);
+                if (!point.anchor) {
+                    continue;
                 }
+                const anchorPose = point.anchor.anchorSpace.getPose(referenceSpace);
+                if (!anchorPose) {
+                    continue;
+                }
+                const t = anchorPose.transform;
+                point.marker.position.set(t.position.x, t.position.y, t.position.z);
+                point.marker.quaternion.set(
+                    t.orientation.x,
+                    t.orientation.y,
+                    t.orientation.z,
+                    t.orientation.w
+                );
             }
         }
 
@@ -623,9 +595,8 @@
                 return;
             }
 
-            const geometry = new THREE.CylinderGeometry(0.002, 0.002, length, 8);
-            const material = new THREE.MeshBasicMaterial({ color: 0x00ff88 });
-            currentLine = new THREE.Mesh(geometry, material);
+            const geometry = new THREE.CylinderGeometry(0.004, 0.004, length, 8);
+            currentLine = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({ color: 0x00ff88 }));
 
             currentLine.position.copy(start).add(end).multiplyScalar(0.5);
             currentLine.quaternion.setFromUnitVectors(upVector, tempDirection.clone().normalize());
@@ -654,7 +625,9 @@
 
         function clearMeasurements() {
             for (const point of placedPoints) {
-                point.anchor.delete();
+                if (point.anchor) {
+                    point.anchor.delete();
+                }
                 scene.remove(point.marker);
             }
             placedPoints.length = 0;
@@ -748,8 +721,9 @@
 
             if (reticle.visible) {
                 reticleLastVisibleAt = performance.now();
-                if (info.textContent === SURFACE_HINT || info.textContent === SCAN_HINT) {
-                    info.textContent = INFO_POINT1;
+                if (placedPoints.length === 0
+                    && (info.textContent === SURFACE_HINT || info.textContent === SCAN_HINT)) {
+                    info.textContent = READY_HINT;
                 }
                 return;
             }
@@ -770,23 +744,20 @@
         }
 
         function render(timestamp, frame) {
-            currentFrame = frame ?? null;
-
-            if (frame && localReferenceSpace) {
+            if (frame) {
+                const referenceSpace = renderer.xr.getReferenceSpace();
                 const session = renderer.xr.getSession();
-                const viewerPose = frame.getViewerPose(localReferenceSpace);
 
-                setupHitTestSources(session);
+                setupHitTestSource(session);
 
-                reticle.visible = false;
-                if (hitTestSource && viewerPose) {
+                if (hitTestSource) {
                     const hitTestResults = frame.getHitTestResults(hitTestSource);
                     if (hitTestResults.length > 0) {
-                        const pose = hitTestResults[0].getPose(localReferenceSpace);
-                        if (pose) {
-                            reticle.visible = true;
-                            reticle.matrix.fromArray(pose.transform.matrix);
-                        }
+                        const hit = hitTestResults[0];
+                        reticle.visible = true;
+                        reticle.matrix.fromArray(hit.getPose(referenceSpace).transform.matrix);
+                    } else {
+                        reticle.visible = false;
                     }
                 }
 
