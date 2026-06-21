@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <meta name="theme-color" content="#00ff88">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <link rel="manifest" href="manifest.webmanifest">
+    <link rel="apple-touch-icon" href="icons/icon-192.png">
+    <title>Ruler — AR Measure</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            overscroll-behavior: none;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: #111;
+            color: white;
+        }
+        #info {
+            position: absolute;
+            top: 10px;
+            width: 100%;
+            text-align: center;
+            z-index: 100;
+            pointer-events: none;
+            text-shadow: 1px 1px 2px black;
+            padding: 0 16px;
+            box-sizing: border-box;
+        }
+        #measurement-label {
+            position: absolute;
+            bottom: 80px;
+            width: 100%;
+            text-align: center;
+            font-size: 2rem;
+            font-weight: bold;
+            z-index: 100;
+            cursor: pointer;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.8);
+            color: #00ff88;
+            user-select: none;
+            -webkit-tap-highlight-color: transparent;
+        }
+        #measurement-label.pulse {
+            animation: pulse 0.6s ease-out;
+        }
+        @keyframes pulse {
+            0% { transform: scale(1); }
+            40% { transform: scale(1.08); }
+            100% { transform: scale(1); }
+        }
+        #unit-hint {
+            position: absolute;
+            bottom: 130px;
+            width: 100%;
+            text-align: center;
+            font-size: 0.75rem;
+            opacity: 0.6;
+            z-index: 100;
+            pointer-events: none;
+        }
+        #clear-btn {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            padding: 12px 24px;
+            font-size: 1rem;
+            background: rgba(255, 255, 255, 0.2);
+            color: white;
+            border: 1px solid white;
+            border-radius: 8px;
+            z-index: 100;
+            cursor: pointer;
+            backdrop-filter: blur(4px);
+            display: none;
+        }
+        #unsupported {
+            display: none;
+            position: fixed;
+            inset: 0;
+            z-index: 200;
+            background: #111;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            padding: 32px;
+            box-sizing: border-box;
+        }
+        #unsupported.visible {
+            display: flex;
+        }
+        #unsupported h1 {
+            font-size: 1.5rem;
+            margin: 0 0 16px;
+        }
+        #unsupported p {
+            opacity: 0.85;
+            line-height: 1.5;
+            max-width: 360px;
+        }
+        #unsupported a {
+            color: #00ff88;
+            margin-top: 24px;
+        }
+    </style>
+</head>
+<body>
+    <div id="unsupported">
+        <h1>AR not supported</h1>
+        <p>This app needs Android Chrome and ARCore support. Your device or browser cannot run AR measurements.</p>
+        <a href="https://developers.google.com/ar/devices" target="_blank" rel="noopener">Check ARCore supported devices</a>
+    </div>
+
+    <div id="info">Ruler<br/>Point phone at floor/surface and tap to place points.</div>
+    <div id="measurement-label">0.00 m</div>
+    <div id="unit-hint">Tap measurement to change units</div>
+    <button id="clear-btn">Clear Points</button>
+
+    <script type="module">
+        import * as THREE from './vendor/three.module.js';
+        import { ARButton } from './vendor/ARButton.js';
+
+        const UNITS = ['m', 'cm', 'in', 'ft'];
+        const UNIT_STORAGE_KEY = 'ruler-unit';
+        const DEFAULT_INFO = 'Ruler<br/>Point phone at floor/surface and tap to place points.';
+        const SURFACE_HINT = 'Move phone slowly and point at a textured surface (floor, table, rug).';
+        const SURFACE_HINT_DELAY_MS = 1000;
+
+        let camera, scene, renderer;
+        let controller, reticle;
+
+        let hitTestSource = null;
+        let hitTestSourceRequested = false;
+        let arSessionActive = false;
+        let reticleLastVisibleAt = 0;
+
+        const measurements = [];
+        let currentLine = null;
+        let pointMeshes = [];
+        let lastDistanceM = 0;
+        let currentUnit = loadUnit();
+
+        const info = document.getElementById('info');
+        const label = document.getElementById('measurement-label');
+        const clearBtn = document.getElementById('clear-btn');
+        const unsupported = document.getElementById('unsupported');
+
+        label.addEventListener('click', cycleUnit);
+        clearBtn.addEventListener('click', () => clearMeasurements());
+
+        start();
+
+        function loadUnit() {
+            const stored = localStorage.getItem(UNIT_STORAGE_KEY);
+            return UNITS.includes(stored) ? stored : 'm';
+        }
+
+        function cycleUnit() {
+            const index = UNITS.indexOf(currentUnit);
+            currentUnit = UNITS[(index + 1) % UNITS.length];
+            localStorage.setItem(UNIT_STORAGE_KEY, currentUnit);
+            if (measurements.length === 2) {
+                updateMeasurementLabel(lastDistanceM, false);
+            } else {
+                label.textContent = formatZero();
+            }
+        }
+
+        function formatDistance(meters) {
+            switch (currentUnit) {
+                case 'm':
+                    return `${meters.toFixed(2)} m`;
+                case 'cm':
+                    return `${(meters * 100).toFixed(1)} cm`;
+                case 'in':
+                    return `${(meters * 39.3701).toFixed(1)} in`;
+                case 'ft': {
+                    const totalInches = meters * 39.3701;
+                    const feet = Math.floor(totalInches / 12);
+                    const inches = totalInches % 12;
+                    return `${feet} ft ${inches.toFixed(1)} in`;
+                }
+            }
+        }
+
+        function formatZero() {
+            switch (currentUnit) {
+                case 'm':
+                    return '0.00 m';
+                case 'cm':
+                    return '0.0 cm';
+                case 'in':
+                    return '0.0 in';
+                case 'ft':
+                    return '0 ft 0.0 in';
+            }
+        }
+
+        async function start() {
+            const xr = navigator.xr;
+            if (!xr || !(await xr.isSessionSupported('immersive-ar'))) {
+                unsupported.classList.add('visible');
+                return;
+            }
+
+            init();
+            animate();
+        }
+
+        function init() {
+            const container = document.createElement('div');
+            document.body.appendChild(container);
+
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+            const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 3);
+            light.position.set(0.5, 1, 0.25);
+            scene.add(light);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            container.appendChild(renderer.domElement);
+
+            document.body.appendChild(ARButton.createButton(renderer, { requiredFeatures: ['hit-test'] }));
+
+            controller = renderer.xr.getController(0);
+            controller.addEventListener('select', onSelect);
+            scene.add(controller);
+
+            reticle = new THREE.Mesh(
+                new THREE.RingGeometry(0.05, 0.06, 32).rotateX(-Math.PI / 2),
+                new THREE.MeshBasicMaterial({ color: 0x00ff88 })
+            );
+            reticle.matrixAutoUpdate = false;
+            reticle.visible = false;
+            scene.add(reticle);
+
+            window.addEventListener('resize', onWindowResize);
+
+            renderer.xr.addEventListener('sessionstart', () => {
+                arSessionActive = true;
+                reticleLastVisibleAt = performance.now();
+                clearBtn.style.display = 'block';
+                info.innerHTML = DEFAULT_INFO;
+            });
+
+            renderer.xr.addEventListener('sessionend', () => {
+                arSessionActive = false;
+                clearBtn.style.display = 'none';
+                info.innerHTML = DEFAULT_INFO;
+            });
+
+            label.textContent = formatZero();
+        }
+
+        function onSelect() {
+            if (!reticle.visible) {
+                return;
+            }
+
+            if (measurements.length >= 2) {
+                clearMeasurements();
+            }
+
+            const geometry = new THREE.SphereGeometry(0.02, 16, 16);
+            const material = new THREE.MeshBasicMaterial({ color: 0xffffff });
+            const sphere = new THREE.Mesh(geometry, material);
+
+            sphere.position.setFromMatrixPosition(reticle.matrix);
+            scene.add(sphere);
+
+            pointMeshes.push(sphere);
+            measurements.push(sphere.position.clone());
+
+            if (measurements.length === 2) {
+                drawLine();
+                calculateDistance();
+            }
+        }
+
+        function drawLine() {
+            const material = new THREE.LineBasicMaterial({ color: 0x00ff88 });
+            const geometry = new THREE.BufferGeometry().setFromPoints(measurements);
+            currentLine = new THREE.Line(geometry, material);
+            scene.add(currentLine);
+        }
+
+        function calculateDistance() {
+            lastDistanceM = measurements[0].distanceTo(measurements[1]);
+            updateMeasurementLabel(lastDistanceM, true);
+        }
+
+        function updateMeasurementLabel(meters, pulse) {
+            label.textContent = formatDistance(meters);
+            if (pulse) {
+                label.classList.remove('pulse');
+                void label.offsetWidth;
+                label.classList.add('pulse');
+            }
+        }
+
+        function clearMeasurements() {
+            measurements.length = 0;
+            pointMeshes.forEach((mesh) => scene.remove(mesh));
+            pointMeshes = [];
+            if (currentLine) {
+                scene.remove(currentLine);
+                currentLine = null;
+            }
+            lastDistanceM = 0;
+            label.textContent = formatZero();
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function updateSurfaceHint() {
+            if (!arSessionActive) {
+                return;
+            }
+
+            if (reticle.visible) {
+                reticleLastVisibleAt = performance.now();
+                if (info.innerHTML === SURFACE_HINT) {
+                    info.innerHTML = DEFAULT_INFO;
+                }
+                return;
+            }
+
+            if (performance.now() - reticleLastVisibleAt >= SURFACE_HINT_DELAY_MS) {
+                info.innerHTML = SURFACE_HINT;
+            }
+        }
+
+        function animate() {
+            renderer.setAnimationLoop(render);
+        }
+
+        function render(timestamp, frame) {
+            if (frame) {
+                const referenceSpace = renderer.xr.getReferenceSpace();
+                const session = renderer.xr.getSession();
+
+                if (hitTestSourceRequested === false) {
+                    session.requestReferenceSpace('viewer').then((viewerSpace) => {
+                        session.requestHitTestSource({ space: viewerSpace }).then((source) => {
+                            hitTestSource = source;
+                        });
+                    });
+                    session.addEventListener('end', () => {
+                        hitTestSourceRequested = false;
+                        hitTestSource = null;
+                    });
+                    hitTestSourceRequested = true;
+                }
+
+                if (hitTestSource) {
+                    const hitTestResults = frame.getHitTestResults(hitTestSource);
+                    if (hitTestResults.length > 0) {
+                        const hit = hitTestResults[0];
+                        reticle.visible = true;
+                        reticle.matrix.fromArray(hit.getPose(referenceSpace).transform.matrix);
+                    } else {
+                        reticle.visible = false;
+                    }
+                }
+
+                updateSurfaceHint();
+            }
+
+            renderer.render(scene, camera);
+        }
+    </script>
+
+    <script>
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.register('./sw.js');
+        }
+    </script>
+</body>
+</html>
