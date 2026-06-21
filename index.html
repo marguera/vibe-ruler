@@ -84,6 +84,28 @@
             padding: 0 16px;
             box-sizing: border-box;
         }
+        #point1-indicator {
+            position: fixed;
+            z-index: 110;
+            display: none;
+            width: 36px;
+            height: 36px;
+            margin-left: -18px;
+            margin-top: -18px;
+            border-radius: 50%;
+            background: rgba(255, 102, 0, 0.85);
+            border: 2px solid white;
+            color: white;
+            font-weight: bold;
+            font-size: 1rem;
+            line-height: 32px;
+            text-align: center;
+            pointer-events: none;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+        }
+        #point1-indicator.visible {
+            display: block;
+        }
         #measurement-label {
             position: absolute;
             bottom: 80px;
@@ -190,16 +212,17 @@
     <div id="launch-screen">
         <div class="logo"></div>
         <h1>Ruler</h1>
-        <p>Measure real-world distances in AR. Point at a floor or table, then tap to place two points.</p>
+        <p>Tap two points on any surface to measure. You can move or rotate the phone between taps.</p>
         <button id="start-btn" type="button">Start measuring</button>
     </div>
 
     <div id="app-version"></div>
+    <div id="point1-indicator">1</div>
 
     <div id="canvas-container"></div>
 
     <div id="ar-ui">
-        <div id="info">Point at a surface and tap to place points.</div>
+        <div id="info">Point at a surface and tap to place point 1.</div>
         <div id="measurement-label">0.00 m</div>
         <div id="unit-hint">Tap measurement to change units</div>
         <button id="clear-btn" type="button">Clear points</button>
@@ -214,15 +237,19 @@
 
         const UNITS = ['m', 'cm', 'in', 'ft'];
         const UNIT_STORAGE_KEY = 'ruler-unit';
-        const DEFAULT_INFO = 'Point at a surface and tap to place points.';
-        const SCAN_HINT = 'Slowly move phone side to side to scan the surface first.';
-        const SURFACE_HINT = 'Move phone slowly and point at a textured surface (floor, table, rug).';
+        const INFO_POINT1 = 'Point at a surface and tap to place point 1.';
+        const SCAN_HINT = 'Slowly move phone side to side to scan the area first.';
+        const SURFACE_HINT = 'Point at a textured surface (floor, table, rug) and tap.';
+        const ROTATE_HINT = 'Point 1 locked. Move phone to the other end, then tap point 2.';
+        const DONE_HINT = 'Tap again to measure something else.';
+        const ANCHOR_FAIL_HINT = 'Could not lock point to surface. Scan more, then retry.';
         const SURFACE_HINT_DELAY_MS = 1000;
 
         const upVector = new THREE.Vector3(0, 1, 0);
         const tempDirection = new THREE.Vector3();
         const tempPositionA = new THREE.Vector3();
         const tempPositionB = new THREE.Vector3();
+        const tempNdc = new THREE.Vector3();
 
         let camera, scene, renderer;
         let reticle;
@@ -237,6 +264,7 @@
         let reticleLastVisibleAt = 0;
         let lastSelectAt = 0;
         let scanHintShown = false;
+        let measurementComplete = false;
 
         const placedPoints = [];
         let currentLine = null;
@@ -252,6 +280,7 @@
         const stopArBtn = document.getElementById('stop-ar-btn');
         const startBtn = document.getElementById('start-btn');
         const unsupported = document.getElementById('unsupported');
+        const point1Indicator = document.getElementById('point1-indicator');
 
         label.addEventListener('click', (event) => {
             event.stopPropagation();
@@ -393,12 +422,13 @@
             resetHitTestSources();
             arSessionActive = true;
             scanHintShown = false;
+            measurementComplete = false;
             reticleLastVisibleAt = performance.now();
 
             launchScreen.classList.add('hidden');
             clearBtn.style.display = 'block';
             stopArBtn.style.display = 'block';
-            info.textContent = DEFAULT_INFO;
+            info.textContent = SCAN_HINT;
         }
 
         function resetHitTestSources() {
@@ -420,11 +450,13 @@
             currentFrame = null;
             resetHitTestSources();
             reticle.visible = false;
+            point1Indicator.classList.remove('visible');
 
+            clearMeasurements();
             launchScreen.classList.remove('hidden');
             clearBtn.style.display = 'none';
             stopArBtn.style.display = 'none';
-            info.textContent = DEFAULT_INFO;
+            info.textContent = INFO_POINT1;
         }
 
         function setupHitTestSources(session) {
@@ -497,33 +529,41 @@
                 clearMeasurements();
             }
 
-            const marker = createPointMarker(pose);
-            scene.add(marker);
-
-            const point = { marker, anchor: null };
-
-            if (typeof frame.createAnchor === 'function') {
-                try {
-                    point.anchor = await frame.createAnchor(pose.transform, localReferenceSpace);
-                } catch {
-                    // Fall back to the fixed local-space matrix captured at tap time
-                }
+            if (typeof frame.createAnchor !== 'function') {
+                info.textContent = 'Anchors not supported. Update Chrome or try another device.';
+                return;
             }
 
-            placedPoints.push(point);
+            let anchor;
+            try {
+                anchor = await frame.createAnchor(pose.transform, localReferenceSpace);
+            } catch (error) {
+                console.error('createAnchor failed', error);
+                info.textContent = ANCHOR_FAIL_HINT;
+                return;
+            }
+
+            const marker = createPointMarker();
+            marker.matrix.fromArray(pose.transform.matrix);
+            scene.add(marker);
+
+            placedPoints.push({ marker, anchor });
+            measurementComplete = false;
             scene.updateMatrixWorld(true);
 
             if (placedPoints.length === 2) {
                 drawLine();
                 calculateDistance(true);
+                measurementComplete = true;
+                info.textContent = DONE_HINT;
+                point1Indicator.classList.remove('visible');
             } else {
-                info.textContent = 'Point 1 placed — tap a second point.';
+                info.textContent = ROTATE_HINT;
             }
         }
 
-        function createPointMarker(pose) {
+        function createPointMarker() {
             const group = new THREE.Group();
-            group.matrix.fromArray(pose.transform.matrix);
             group.matrixAutoUpdate = false;
 
             const markerMaterial = new THREE.MeshBasicMaterial({ color: 0xff6600 });
@@ -547,8 +587,9 @@
             return group;
         }
 
-        function getPointWorldPosition(marker, target) {
-            return target.setFromMatrixPosition(marker.matrix);
+        function getMarkerPosition(marker, target) {
+            marker.updateMatrixWorld(true);
+            return target.setFromMatrixPosition(marker.matrixWorld);
         }
 
         function updateAnchoredPoints() {
@@ -557,10 +598,6 @@
             }
 
             for (const point of placedPoints) {
-                if (!point.anchor) {
-                    continue;
-                }
-
                 const anchorPose = point.anchor.anchorSpace.getPose(localReferenceSpace);
                 if (anchorPose) {
                     point.marker.matrix.fromArray(anchorPose.transform.matrix);
@@ -578,8 +615,8 @@
                 currentLine = null;
             }
 
-            const start = getPointWorldPosition(placedPoints[0].marker, tempPositionA);
-            const end = getPointWorldPosition(placedPoints[1].marker, tempPositionB);
+            const start = getMarkerPosition(placedPoints[0].marker, tempPositionA);
+            const end = getMarkerPosition(placedPoints[1].marker, tempPositionB);
             tempDirection.subVectors(end, start);
             const length = tempDirection.length();
             if (length < 0.001) {
@@ -600,13 +637,10 @@
                 return;
             }
 
-            const start = getPointWorldPosition(placedPoints[0].marker, tempPositionA);
-            const end = getPointWorldPosition(placedPoints[1].marker, tempPositionB);
+            const start = getMarkerPosition(placedPoints[0].marker, tempPositionA);
+            const end = getMarkerPosition(placedPoints[1].marker, tempPositionB);
             lastDistanceM = start.distanceTo(end);
             updateMeasurementLabel(lastDistanceM, pulse);
-            if (pulse) {
-                info.textContent = 'Tap again to measure something else.';
-            }
         }
 
         function updateMeasurementLabel(meters, pulse) {
@@ -620,9 +654,7 @@
 
         function clearMeasurements() {
             for (const point of placedPoints) {
-                if (point.anchor) {
-                    point.anchor.delete();
-                }
+                point.anchor.delete();
                 scene.remove(point.marker);
             }
             placedPoints.length = 0;
@@ -631,19 +663,80 @@
                 scene.remove(currentLine);
                 currentLine = null;
             }
+
             lastDistanceM = 0;
+            measurementComplete = false;
+            point1Indicator.classList.remove('visible');
             label.textContent = formatZero();
-            info.textContent = DEFAULT_INFO;
+            if (arSessionActive) {
+                info.textContent = INFO_POINT1;
+            }
         }
 
-        function onWindowResize() {
-            camera.aspect = window.innerWidth / window.innerHeight;
-            camera.updateProjectionMatrix();
-            renderer.setSize(window.innerWidth, window.innerHeight);
+        function updatePoint1Indicator() {
+            if (placedPoints.length !== 1) {
+                point1Indicator.classList.remove('visible');
+                return;
+            }
+
+            getMarkerPosition(placedPoints[0].marker, tempNdc);
+            tempNdc.project(camera);
+
+            const w = window.innerWidth;
+            const h = window.innerHeight;
+            const margin = 28;
+
+            if (tempNdc.z > 1) {
+                tempNdc.x = -tempNdc.x;
+                tempNdc.y = -tempNdc.y;
+            }
+
+            const screenX = (tempNdc.x * 0.5 + 0.5) * w;
+            const screenY = (-tempNdc.y * 0.5 + 0.5) * h;
+            const onScreen = tempNdc.z <= 1
+                && screenX >= margin && screenX <= w - margin
+                && screenY >= margin && screenY <= h - margin;
+
+            if (onScreen) {
+                point1Indicator.classList.remove('visible');
+                return;
+            }
+
+            const cx = w / 2;
+            const cy = h / 2;
+            let dx = screenX - cx;
+            let dy = screenY - cy;
+
+            if (tempNdc.z > 1) {
+                dx = -dx;
+                dy = -dy;
+            }
+
+            if (Math.abs(dx) < 0.001 && Math.abs(dy) < 0.001) {
+                dy = -1;
+            }
+
+            const scale = Math.min(
+                (w / 2 - margin) / Math.max(Math.abs(dx), 0.001),
+                (h / 2 - margin) / Math.max(Math.abs(dy), 0.001)
+            );
+
+            point1Indicator.style.left = `${cx + dx * scale}px`;
+            point1Indicator.style.top = `${cy + dy * scale}px`;
+            point1Indicator.classList.add('visible');
         }
 
-        function updateSurfaceHint() {
+        function updateInfoHint() {
             if (!arSessionActive) {
+                return;
+            }
+
+            if (placedPoints.length === 1) {
+                info.textContent = ROTATE_HINT;
+                return;
+            }
+
+            if (measurementComplete) {
                 return;
             }
 
@@ -656,7 +749,7 @@
             if (reticle.visible) {
                 reticleLastVisibleAt = performance.now();
                 if (info.textContent === SURFACE_HINT || info.textContent === SCAN_HINT) {
-                    info.textContent = DEFAULT_INFO;
+                    info.textContent = INFO_POINT1;
                 }
                 return;
             }
@@ -664,6 +757,12 @@
             if (performance.now() - reticleLastVisibleAt >= SURFACE_HINT_DELAY_MS) {
                 info.textContent = SURFACE_HINT;
             }
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
         }
 
         function animate() {
@@ -692,12 +791,14 @@
                 }
 
                 updateAnchoredPoints();
+
                 if (placedPoints.length === 2) {
                     drawLine();
                     calculateDistance(false);
                 }
 
-                updateSurfaceHint();
+                updatePoint1Indicator();
+                updateInfoHint();
             }
 
             renderer.render(scene, camera);
