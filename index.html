@@ -25,26 +25,49 @@
         #canvas-container canvas {
             display: block;
         }
-        #tap-prompt {
+        #launch-screen {
             position: fixed;
             inset: 0;
             z-index: 50;
-            display: none;
+            display: flex;
+            flex-direction: column;
             align-items: center;
             justify-content: center;
             text-align: center;
             padding: 32px;
             box-sizing: border-box;
-            background: #111;
-            cursor: pointer;
+            background: radial-gradient(circle at center, #1a1a1a 0%, #111 70%);
         }
-        #tap-prompt.visible {
-            display: flex;
+        #launch-screen.hidden {
+            display: none;
         }
-        #tap-prompt p {
-            margin: 0;
-            opacity: 0.7;
+        #launch-screen .logo {
+            width: 72px;
+            height: 72px;
+            border: 3px solid #00ff88;
+            border-radius: 50%;
+            margin-bottom: 24px;
+            box-shadow: 0 0 24px rgba(0, 255, 136, 0.25);
+        }
+        #launch-screen h1 {
+            margin: 0 0 12px;
+            font-size: 1.75rem;
+        }
+        #launch-screen p {
+            margin: 0 0 28px;
+            opacity: 0.75;
+            line-height: 1.5;
+            max-width: 320px;
+        }
+        #start-btn {
+            padding: 14px 32px;
             font-size: 1.1rem;
+            font-weight: 600;
+            background: #00ff88;
+            color: #111;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
         }
         #ar-ui {
             position: fixed;
@@ -164,8 +187,11 @@
         <a href="https://developers.google.com/ar/devices" target="_blank" rel="noopener">Check ARCore supported devices</a>
     </div>
 
-    <div id="tap-prompt">
-        <p>Tap to start camera</p>
+    <div id="launch-screen">
+        <div class="logo"></div>
+        <h1>Ruler</h1>
+        <p>Measure real-world distances in AR. Point at a floor or table, then tap to place two points.</p>
+        <button id="start-btn" type="button">Start measuring</button>
     </div>
 
     <div id="app-version"></div>
@@ -191,23 +217,28 @@
         const DEFAULT_INFO = 'Point at a surface and tap to place points.';
         const SURFACE_HINT = 'Move phone slowly and point at a textured surface (floor, table, rug).';
         const SURFACE_HINT_DELAY_MS = 1000;
+        const RETICLE_MEMORY_MS = 800;
 
         const upVector = new THREE.Vector3(0, 1, 0);
         const tempDirection = new THREE.Vector3();
         const tempPosition = new THREE.Vector3();
         const tempQuaternion = new THREE.Quaternion();
         const tempScale = new THREE.Vector3();
+        const lastReticleMatrix = new THREE.Matrix4();
 
         let camera, scene, renderer;
         let controller;
         let reticle;
         let xrSession = null;
+        let currentFrame = null;
 
         let hitTestSource = null;
         let transientHitTestSource = null;
         let hitTestSourceRequested = false;
         let arSessionActive = false;
         let reticleLastVisibleAt = 0;
+        let lastReticleAt = 0;
+        let lastSelectAt = 0;
 
         const measurements = [];
         let currentLine = null;
@@ -215,13 +246,14 @@
         let lastDistanceM = 0;
         let currentUnit = loadUnit();
 
-        const tapPrompt = document.getElementById('tap-prompt');
+        const launchScreen = document.getElementById('launch-screen');
         const canvasContainer = document.getElementById('canvas-container');
         const arUi = document.getElementById('ar-ui');
         const info = document.getElementById('info');
         const label = document.getElementById('measurement-label');
         const clearBtn = document.getElementById('clear-btn');
         const stopArBtn = document.getElementById('stop-ar-btn');
+        const startBtn = document.getElementById('start-btn');
         const unsupported = document.getElementById('unsupported');
 
         label.addEventListener('click', (event) => {
@@ -236,7 +268,8 @@
             event.stopPropagation();
             endARSession();
         });
-        tapPrompt.addEventListener('click', () => {
+        startBtn.addEventListener('click', (event) => {
+            event.stopPropagation();
             startARSession();
         });
 
@@ -292,17 +325,17 @@
             const xr = navigator.xr;
             if (!xr || !(await xr.isSessionSupported('immersive-ar'))) {
                 unsupported.classList.add('visible');
+                launchScreen.classList.add('hidden');
                 return;
             }
 
             init();
             animate();
-            await tryAutoStartAR();
         }
 
         function init() {
             scene = new THREE.Scene();
-            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 40);
 
             const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 3);
             light.position.set(0.5, 1, 0.25);
@@ -311,10 +344,12 @@
             renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
             renderer.setPixelRatio(window.devicePixelRatio);
             renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setClearColor(0x000000, 0);
             renderer.xr.enabled = true;
             canvasContainer.appendChild(renderer.domElement);
 
             controller = renderer.xr.getController(0);
+            controller.addEventListener('select', onSelect);
             scene.add(controller);
 
             reticle = new THREE.Mesh(
@@ -332,36 +367,22 @@
 
         const sessionInit = {
             requiredFeatures: ['hit-test'],
-            optionalFeatures: ['dom-overlay'],
+            optionalFeatures: ['dom-overlay', 'local-floor'],
             domOverlay: { root: arUi },
         };
-
-        async function tryAutoStartAR() {
-            const xr = navigator.xr;
-            if (xr.offerSession) {
-                try {
-                    const session = await xr.offerSession('immersive-ar', sessionInit);
-                    await attachARSession(session);
-                    return;
-                } catch {
-                    // offerSession unavailable or declined — fall through
-                }
-            }
-
-            try {
-                await startARSession();
-            } catch {
-                showTapPrompt();
-            }
-        }
 
         async function startARSession() {
             if (xrSession) {
                 return;
             }
 
-            const session = await navigator.xr.requestSession('immersive-ar', sessionInit);
-            await attachARSession(session);
+            try {
+                const session = await navigator.xr.requestSession('immersive-ar', sessionInit);
+                await attachARSession(session);
+            } catch (error) {
+                console.error('Failed to start AR session', error);
+                info.textContent = 'Could not start AR. Check camera permission and try again.';
+            }
         }
 
         async function attachARSession(session) {
@@ -370,14 +391,19 @@
             session.addEventListener('end', onARSessionEnded);
             session.addEventListener('select', onSelect);
 
-            renderer.xr.setReferenceSpaceType('local');
-            await renderer.xr.setSession(session);
+            try {
+                renderer.xr.setReferenceSpaceType('local-floor');
+                await renderer.xr.setSession(session);
+            } catch {
+                renderer.xr.setReferenceSpaceType('local');
+                await renderer.xr.setSession(session);
+            }
 
             resetHitTestSources();
             arSessionActive = true;
             reticleLastVisibleAt = performance.now();
 
-            tapPrompt.classList.remove('visible');
+            launchScreen.classList.add('hidden');
             clearBtn.style.display = 'block';
             stopArBtn.style.display = 'block';
             info.textContent = DEFAULT_INFO;
@@ -389,10 +415,6 @@
             transientHitTestSource = null;
         }
 
-        function showTapPrompt() {
-            tapPrompt.classList.add('visible');
-        }
-
         function endARSession() {
             if (xrSession) {
                 xrSession.end();
@@ -402,13 +424,14 @@
         function onARSessionEnded() {
             xrSession = null;
             arSessionActive = false;
+            currentFrame = null;
             resetHitTestSources();
             reticle.visible = false;
 
+            launchScreen.classList.remove('hidden');
             clearBtn.style.display = 'none';
             stopArBtn.style.display = 'none';
             info.textContent = DEFAULT_INFO;
-            showTapPrompt();
         }
 
         function setupHitTestSources(session) {
@@ -423,47 +446,63 @@
                 session.requestHitTestSourceForTransientInput('generic-touchscreen').then((source) => {
                     transientHitTestSource = source;
                 }).catch(() => {
-                    // Transient input unavailable — reticle placement still works
+                    // Transient input unavailable on this device
                 });
             });
 
             hitTestSourceRequested = true;
         }
 
-        function getTapPosition(frame, referenceSpace) {
+        function poseToMatrix(pose) {
+            const matrix = new THREE.Matrix4();
+            matrix.fromArray(pose.transform.matrix);
+            return matrix;
+        }
+
+        function getTapMatrix(frame, referenceSpace) {
             if (transientHitTestSource) {
                 const transientResults = frame.getHitTestResultsForTransientInput(transientHitTestSource);
                 if (transientResults.length > 0) {
                     const pose = transientResults[0].getPose(referenceSpace);
                     if (pose) {
-                        tempPosition.set(
-                            pose.transform.position.x,
-                            pose.transform.position.y,
-                            pose.transform.position.z
-                        );
-                        return tempPosition.clone();
+                        return poseToMatrix(pose);
                     }
                 }
             }
 
             if (reticle.visible) {
-                reticle.matrix.decompose(tempPosition, tempQuaternion, tempScale);
-                return tempPosition.clone();
+                return reticle.matrix.clone();
+            }
+
+            if (performance.now() - lastReticleAt < RETICLE_MEMORY_MS) {
+                return lastReticleMatrix.clone();
             }
 
             return null;
         }
 
+        function matrixToPosition(matrix) {
+            matrix.decompose(tempPosition, tempQuaternion, tempScale);
+            return tempPosition.clone();
+        }
+
         function onSelect(event) {
-            const frame = event.frame;
+            const now = performance.now();
+            if (now - lastSelectAt < 250) {
+                return;
+            }
+
+            const frame = event.frame ?? currentFrame;
             if (!frame || !arSessionActive) {
                 return;
             }
 
-            const referenceSpace = renderer.xr.getReferenceSpace();
-            const position = getTapPosition(frame, referenceSpace);
+            lastSelectAt = now;
 
-            if (!position) {
+            const referenceSpace = renderer.xr.getReferenceSpace();
+            const tapMatrix = getTapMatrix(frame, referenceSpace);
+
+            if (!tapMatrix) {
                 info.textContent = SURFACE_HINT;
                 return;
             }
@@ -472,7 +511,8 @@
                 clearMeasurements();
             }
 
-            const marker = createPointMarker(position);
+            const position = matrixToPosition(tapMatrix);
+            const marker = createPointMarker(tapMatrix);
             scene.add(marker);
             pointMeshes.push(marker);
             measurements.push(position);
@@ -481,27 +521,45 @@
                 drawLine();
                 calculateDistance();
             } else {
-                info.textContent = 'Tap a second point to measure.';
+                info.textContent = 'Point 1 placed — tap a second point.';
             }
         }
 
-        function createPointMarker(position) {
+        function createPointMarker(tapMatrix) {
             const group = new THREE.Group();
+            group.matrix.copy(tapMatrix);
+            group.matrixAutoUpdate = false;
             group.renderOrder = 1000;
 
-            const sphere = new THREE.Mesh(
-                new THREE.SphereGeometry(0.035, 16, 16),
-                new THREE.MeshBasicMaterial({ color: 0xffffff, depthTest: false, depthWrite: false })
+            const markerMaterial = new THREE.MeshBasicMaterial({
+                color: 0xff6600,
+                depthTest: false,
+                depthWrite: false,
+                toneMapped: false,
+            });
+
+            const sphere = new THREE.Mesh(new THREE.SphereGeometry(0.05, 16, 16), markerMaterial);
+
+            const pole = new THREE.Mesh(
+                new THREE.CylinderGeometry(0.012, 0.012, 0.2, 8),
+                markerMaterial
             );
+            pole.position.y = 0.1;
 
             const ring = new THREE.Mesh(
-                new THREE.RingGeometry(0.05, 0.065, 32).rotateX(-Math.PI / 2),
-                new THREE.MeshBasicMaterial({ color: 0x00ff88, depthTest: false, depthWrite: false, side: THREE.DoubleSide })
+                new THREE.RingGeometry(0.07, 0.085, 32).rotateX(-Math.PI / 2),
+                new THREE.MeshBasicMaterial({
+                    color: 0x00ff88,
+                    depthTest: false,
+                    depthWrite: false,
+                    side: THREE.DoubleSide,
+                    toneMapped: false,
+                })
             );
 
             group.add(sphere);
+            group.add(pole);
             group.add(ring);
-            group.position.copy(position);
             return group;
         }
 
@@ -510,14 +568,22 @@
             const end = measurements[1];
             tempDirection.subVectors(end, start);
             const length = tempDirection.length();
+            if (length < 0.001) {
+                return;
+            }
 
-            const geometry = new THREE.CylinderGeometry(0.008, 0.008, length, 8);
-            const material = new THREE.MeshBasicMaterial({ color: 0x00ff88, depthTest: false, depthWrite: false });
+            const geometry = new THREE.CylinderGeometry(0.012, 0.012, length, 8);
+            const material = new THREE.MeshBasicMaterial({
+                color: 0x00ff88,
+                depthTest: false,
+                depthWrite: false,
+                toneMapped: false,
+            });
             currentLine = new THREE.Mesh(geometry, material);
             currentLine.renderOrder = 999;
 
             currentLine.position.copy(start).add(end).multiplyScalar(0.5);
-            currentLine.quaternion.setFromUnitVectors(upVector, tempDirection.normalize());
+            currentLine.quaternion.setFromUnitVectors(upVector, tempDirection.clone().normalize());
             scene.add(currentLine);
         }
 
@@ -578,6 +644,8 @@
         }
 
         function render(timestamp, frame) {
+            currentFrame = frame ?? null;
+
             if (frame) {
                 const referenceSpace = renderer.xr.getReferenceSpace();
                 const session = renderer.xr.getSession();
@@ -590,6 +658,8 @@
                         const hit = hitTestResults[0];
                         reticle.visible = true;
                         reticle.matrix.fromArray(hit.getPose(referenceSpace).transform.matrix);
+                        lastReticleMatrix.copy(reticle.matrix);
+                        lastReticleAt = performance.now();
                     } else {
                         reticle.visible = false;
                     }
